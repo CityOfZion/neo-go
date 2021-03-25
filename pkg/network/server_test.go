@@ -18,6 +18,7 @@ import (
 	"github.com/nspcc-dev/neo-go/pkg/core/block"
 	"github.com/nspcc-dev/neo-go/pkg/core/interop"
 	"github.com/nspcc-dev/neo-go/pkg/core/transaction"
+	"github.com/nspcc-dev/neo-go/pkg/io"
 	"github.com/nspcc-dev/neo-go/pkg/network/capability"
 	"github.com/nspcc-dev/neo-go/pkg/network/payload"
 	"github.com/nspcc-dev/neo-go/pkg/util"
@@ -464,6 +465,17 @@ func TestTransaction(t *testing.T) {
 
 		s.testHandleMessage(t, nil, CMDTX, tx)
 		require.Contains(t, s.consensus.(*fakeConsensus).txs, tx)
+
+		t.Run("batch", func(t *testing.T) {
+			tx1 := newDummyTx()
+			tx2 := newDummyTx()
+			s.testHandleMessage(t, nil, CMDTxBatch, &payload.Transactions{
+				Network: netmode.UnitTestNet,
+				Values:  []*transaction.Transaction{tx1, tx2},
+			})
+			require.Contains(t, s.consensus.(*fakeConsensus).txs, tx1)
+			require.Contains(t, s.consensus.(*fakeConsensus).txs, tx2)
+		})
 	})
 	t.Run("bad", func(t *testing.T) {
 		tx := newDummyTx()
@@ -475,17 +487,17 @@ func TestTransaction(t *testing.T) {
 	})
 }
 
-func (s *Server) testHandleGetData(t *testing.T, invType payload.InventoryType, hs, notFound []util.Uint256, found payload.Payload) {
-	var recvResponse atomic.Bool
+func (s *Server) testHandleGetData(t *testing.T, invType payload.InventoryType, hs, notFound []util.Uint256, found ...payload.Payload) {
+	var recvResponse atomic.Uint32
 	var recvNotFound atomic.Bool
 
 	p := newLocalPeer(t, s)
 	p.handshaked = true
 	p.messageHandler = func(t *testing.T, msg *Message) {
 		switch msg.Command {
-		case CMDTX, CMDBlock, CMDExtensible, CMDP2PNotaryRequest:
-			require.Equal(t, found, msg.Payload)
-			recvResponse.Store(true)
+		case CMDTxBatch, CMDTX, CMDBlock, CMDExtensible, CMDP2PNotaryRequest:
+			require.Equal(t, found[recvResponse.Load()], msg.Payload)
+			recvResponse.Inc()
 		case CMDNotFound:
 			require.Equal(t, notFound, msg.Payload.(*payload.Inventory).Hashes)
 			recvNotFound.Store(true)
@@ -494,7 +506,7 @@ func (s *Server) testHandleGetData(t *testing.T, invType payload.InventoryType, 
 
 	s.testHandleMessage(t, p, CMDGetData, payload.NewInventory(invType, hs))
 
-	require.Eventually(t, func() bool { return recvResponse.Load() }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return recvResponse.Load() == uint32(len(found)) }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool { return recvNotFound.Load() }, time.Second, time.Millisecond)
 }
 
@@ -510,11 +522,37 @@ func TestGetData(t *testing.T) {
 		s.testHandleGetData(t, payload.BlockType, hs, notFound, b)
 	})
 	t.Run("transaction", func(t *testing.T) {
-		tx := newDummyTx()
-		hs := []util.Uint256{random.Uint256(), tx.Hash(), random.Uint256()}
-		s.chain.(*fakechain.FakeChain).PutTx(tx)
-		notFound := []util.Uint256{hs[0], hs[2]}
-		s.testHandleGetData(t, payload.TXType, hs, notFound, tx)
+		t.Run("simple", func(t *testing.T) {
+			tx1 := newDummyTx()
+			tx2 := newDummyTx()
+			hs := []util.Uint256{random.Uint256(), tx1.Hash(), random.Uint256(), tx2.Hash()}
+			s.chain.(*fakechain.FakeChain).PutTx(tx1)
+			s.chain.(*fakechain.FakeChain).PutTx(tx2)
+			notFound := []util.Uint256{hs[0], hs[2]}
+			s.testHandleGetData(t, payload.TXType, hs, notFound, &payload.Transactions{
+				Network: netmode.UnitTestNet,
+				Values:  []*transaction.Transaction{tx1, tx2},
+			})
+		})
+		t.Run("big", func(t *testing.T) {
+			bigAttr := transaction.Attribute{
+				Type:  transaction.ReservedUpperBound,
+				Value: &transaction.Reserved{Value: make([]byte, io.MaxArraySize)},
+			}
+			tx1 := newDummyTx(bigAttr)
+			tx2 := newDummyTx(bigAttr)
+			hs := []util.Uint256{random.Uint256(), tx1.Hash(), tx2.Hash()}
+			s.chain.(*fakechain.FakeChain).PutTx(tx1)
+			s.chain.(*fakechain.FakeChain).PutTx(tx2)
+			notFound := []util.Uint256{hs[0]}
+			s.testHandleGetData(t, payload.TXType, hs, notFound, &payload.Transactions{
+				Network: netmode.UnitTestNet,
+				Values:  []*transaction.Transaction{tx1},
+			}, &payload.Transactions{
+				Network: netmode.UnitTestNet,
+				Values:  []*transaction.Transaction{tx2},
+			})
+		})
 	})
 	t.Run("p2pNotaryRequest", func(t *testing.T) {
 		mainTx := &transaction.Transaction{

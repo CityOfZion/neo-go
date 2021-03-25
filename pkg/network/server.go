@@ -685,14 +685,23 @@ func (s *Server) handleMempoolCmd(p Peer) error {
 // handleInvCmd processes the received inventory.
 func (s *Server) handleGetDataCmd(p Peer, inv *payload.Inventory) error {
 	var notFound []util.Uint256
+	var tx *transaction.Transaction
+	var txs []*transaction.Transaction
+	var size int
 	for _, hash := range inv.Hashes {
 		var msg *Message
 
 		switch inv.Type {
 		case payload.TXType:
-			tx, _, err := s.chain.GetTransaction(hash)
+			var err error
+			tx, _, err = s.chain.GetTransaction(hash)
 			if err == nil {
-				msg = NewMessage(CMDTX, tx)
+				size += tx.Size()
+				if size < payload.MaxSize-4 && len(txs) < payload.MaxBatchSize {
+					txs = append(txs, tx)
+				} else {
+					msg = NewMessage(CMDTxBatch, &payload.Transactions{Values: txs})
+				}
 			} else {
 				notFound = append(notFound, hash)
 			}
@@ -717,15 +726,26 @@ func (s *Server) handleGetDataCmd(p Peer, inv *payload.Inventory) error {
 		if msg != nil {
 			pkt, err := msg.Bytes()
 			if err == nil {
-				if inv.Type == payload.ExtensibleType {
+				switch inv.Type {
+				case payload.ExtensibleType:
 					err = p.EnqueueHPPacket(true, pkt)
-				} else {
+				case payload.TXType:
+					size = tx.Size()
+					txs = append(txs[:0], tx)
+					fallthrough
+				default:
 					err = p.EnqueueP2PPacket(pkt)
 				}
 			}
 			if err != nil {
 				return err
 			}
+		}
+	}
+	if len(txs) != 0 {
+		msg := NewMessage(CMDTxBatch, &payload.Transactions{Values: txs})
+		if err := p.EnqueueP2PMessage(msg); err != nil {
+			return err
 		}
 	}
 	if len(notFound) != 0 {
@@ -851,12 +871,14 @@ func (s *Server) handleExtensibleCmd(e *payload.Extensible) error {
 
 // handleTxCmd processes received transaction.
 // It never returns an error.
-func (s *Server) handleTxCmd(tx *transaction.Transaction) error {
+func (s *Server) handleTxCmd(txs ...*transaction.Transaction) error {
 	// It's OK for it to fail for various reasons like tx already existing
 	// in the pool.
-	if s.verifyAndPoolTX(tx) == nil {
-		s.consensus.OnTransaction(tx)
-		s.broadcastTX(tx, nil)
+	for _, tx := range txs {
+		if s.verifyAndPoolTX(tx) == nil {
+			s.consensus.OnTransaction(tx)
+			s.broadcastTX(tx, nil)
+		}
 	}
 	return nil
 }
@@ -1027,6 +1049,10 @@ func (s *Server) handleMessage(peer Peer, msg *Message) error {
 		case CMDTX:
 			tx := msg.Payload.(*transaction.Transaction)
 			return s.handleTxCmd(tx)
+		case CMDTxBatch:
+			txs := msg.Payload.(*payload.Transactions)
+			//s.log.Info("received tx batch", zap.Int("count", len(txs.Values)))
+			return s.handleTxCmd(txs.Values...)
 		case CMDP2PNotaryRequest:
 			r := msg.Payload.(*payload.P2PNotaryRequest)
 			return s.handleP2PNotaryRequestCmd(r)

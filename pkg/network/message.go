@@ -75,6 +75,7 @@ const (
 	CMDBlock                        = CommandType(payload.BlockType)
 	CMDExtensible                   = CommandType(payload.ExtensibleType)
 	CMDP2PNotaryRequest             = CommandType(payload.P2PNotaryRequestType)
+	CMDTxBatch                      = 0x51
 	CMDReject           CommandType = 0x2f
 
 	// SPV protocol
@@ -160,6 +161,8 @@ func (m *Message) decodePayload() error {
 		p = &payload.Headers{Network: m.Network, StateRootInHeader: m.StateRootInHeader}
 	case CMDTX:
 		p = &transaction.Transaction{Network: m.Network}
+	case CMDTxBatch:
+		p = &payload.Transactions{Network: m.Network}
 	case CMDMerkleBlock:
 		p = &payload.MerkleBlock{Network: m.Network}
 	case CMDPing, CMDPong:
