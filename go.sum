@@ -131,8 +131,8 @@ github.com/nspcc-dev/dbft v0.0.0-20191205084618-dacb1a30c254/go.mod h1:w1Ln2aT+d
 github.com/nspcc-dev/dbft v0.0.0-20191209120240-0d6b7568d9ae/go.mod h1:3FjXOoHmA51EGfb5GS/HOv7VdmngNRTssSeQ729dvGY=
 github.com/nspcc-dev/dbft v0.0.0-20200117124306-478e5cfbf03a/go.mod h1:/YFK+XOxxg0Bfm6P92lY5eDSLYfp06XOdL8KAVgXjVk=
 github.com/nspcc-dev/dbft v0.0.0-20200219114139-199d286ed6c1/go.mod h1:O0qtn62prQSqizzoagHmuuKoz8QMkU3SzBoKdEvm3aQ=
-github.com/nspcc-dev/dbft v0.0.0-20200925163137-8f3b9ab3b720 h1:e/lFQUIPnWErf2yiHjp2HyPhf0nyo3lp4hMm8IlQX1U=
-github.com/nspcc-dev/dbft v0.0.0-20200925163137-8f3b9ab3b720/go.mod h1:I5D0W3tu3epdt2RMCTxS//HDr4S+OHRqajouQTOAHI8=
+github.com/nspcc-dev/dbft v0.0.0-20210122071512-d9a728094f0d h1:uUaRysqa/9VtHETVARUlteqfbXAgwxR2nvUc4DzK4pI=
+github.com/nspcc-dev/dbft v0.0.0-20210122071512-d9a728094f0d/go.mod h1:I5D0W3tu3epdt2RMCTxS//HDr4S+OHRqajouQTOAHI8=
 github.com/nspcc-dev/neo-go v0.73.1-pre.0.20200303142215-f5a1b928ce09/go.mod h1:pPYwPZ2ks+uMnlRLUyXOpLieaDQSEaf4NM3zHVbRjmg=
 github.com/nspcc-dev/neofs-crypto v0.2.0/go.mod h1:F/96fUzPM3wR+UGsPi3faVNmFlA9KAEAUQR7dMxZmNA=
 github.com/nspcc-dev/neofs-crypto v0.2.3 h1:aca3X2aly92ENRbFK+kH6Hd+J9EQ4Eu6XMVoITSIKtc=
