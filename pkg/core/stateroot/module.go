@@ -195,9 +195,9 @@ func (s *Module) verifyWitness(r *state.MPTRoot) error {
 
 // Traverse traverses local MPT nodes starting from the specified root down to its
 // children calling f for each serialised node until stop condition is satisfied.
-func (s *Module) Traverse(root util.Uint256, stop func(node []byte) bool) error {
+func (s *Module) Traverse(root util.Uint256, stop func(node mpt.Node, nodeBytes []byte) bool, ignoreStorageErr bool) error {
 	tr := mpt.NewTrie(mpt.NewHashNode(root), false, storage.NewMemCachedStore(s.Store))
-	return tr.Traverse(stop)
+	return tr.Traverse(stop, ignoreStorageErr)
 }
 
 // RestoreMPTNode tries to replace HashNode specified by the path to its "unhashed"

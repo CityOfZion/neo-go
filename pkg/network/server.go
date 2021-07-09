@@ -626,11 +626,90 @@ func (s *Server) IsInSync() bool {
 		syncInterval := uint32(s.chain.GetConfig().StateSyncInterval)
 		// choose the height of the median peer as current chain's height
 		p1 := (heights[len(heights)/2] / syncInterval) * syncInterval
+
+		// There are 5 stages which are possible during state sync process.
+		// 1) If chain's height is too low to start state exchange process, then use the standard sync mechanism
 		if p1 < 2*syncInterval {
-			// chain is too low to start state exchange process, use the standard sync mechanism
 			s.canStartSync.CAS(false, true)
-		} else if s.p.CAS(0, p1) {
-			s.log.Info("try to sync state for latest state synchronization point", zap.Uint32("height", p1))
+		} else {
+			if s.p.CAS(0, p1) {
+				s.log.Info("try to sync state for latest state synchronization point", zap.Uint32("height", p1))
+			}
+			// 2) If headers are not yet fetched for P1, then MPT is not initialized for P1 and blocks are not yet fetched.
+			//    Check this and ask for headers, handleHeadersCmd will do the rest of the job
+			if s.chain.HeaderHeight() < p1 {
+				if s.GetStateRoot().CurrentLocalHeight() >= p1 {
+					s.log.Fatal("failed to start state sync process: bad MPT state") // hardly ever
+				}
+				if s.chain.BlockHeight() >= p1 {
+					s.log.Fatal("failed to start state sync process: bad chain state") // hardly ever
+				}
+			} else {
+				var (
+					mptInSync    bool
+					blocksInSync bool
+				)
+				sr := s.GetStateRoot()
+				h := sr.CurrentLocalHeight()
+				// 3) Headers are already fetched, thus stateroot for P1 (or for P<P1) is stored. Check that MPT is in sync.
+				if h < p1 {
+					// 3.1) Another stateroot may be stored (i.e. for height < P1), thus need to store actual stateroot and request MPT state for P1
+					stateRoot := s.initOnRestore(p1)
+					msg := NewMessage(CMDGetMPTData, payload.NewMPTInventory([]util.Uint256{stateRoot}))
+					s.broadcastMessage(msg)
+				} else if h == p1 {
+					// 3.2) Stateroot for P1 is stored, so traverse local MPT and request unknown hash nodes
+					unknownNodes := make(map[util.Uint256][]byte)
+					unknownNodes[sr.CurrentLocalStateRoot()] = []byte{}
+					err := sr.Traverse(sr.CurrentLocalStateRoot(), func(n mpt.Node, _ []byte) bool {
+						path, ok := unknownNodes[n.Hash()]
+						if !ok {
+							panic("bug")
+						}
+						delete(unknownNodes, n.Hash())
+						childrenPaths := mpt.GetChildrenPaths(path, n)
+						for h, p := range childrenPaths {
+							unknownNodes[h] = p
+						}
+						return false
+					}, true)
+					if err != nil {
+						s.log.Warn("failed to traverse MPT while initialization", zap.Error(err))
+					}
+					s.mptPool.Update(nil, unknownNodes)
+					if len(unknownNodes) == 0 {
+						mptInSync = true
+					}
+					// TODO: request nodes
+				} else {
+					mptInSync = true
+				}
+				if mptInSync {
+					s.log.Info("MPT is in sync",
+						zap.Uint32("height", s.chain.GetStateModule().CurrentLocalHeight()),
+						zap.String("state root", s.chain.GetStateModule().CurrentLocalStateRoot().StringBE()))
+				}
+
+				// 4) check blocks are in sync, if not then they'll be requested
+				if s.chain.BlockHeight() < p1 {
+					err := s.chain.InitOnRestore(p1)
+					if err != nil {
+						s.log.Warn("failed to initialize blockchain for state exchange", zap.Error(err))
+					}
+				} else {
+					blocksInSync = true
+					s.log.Info("blocks are in sync",
+						zap.Uint32("height", s.chain.BlockHeight()))
+				}
+
+				// 5) all OK, then state sync for P is reached, start normal sync process
+				if mptInSync && blocksInSync && s.canStartSync.CAS(false, true) {
+					s.log.Info("state sync for the latest state synchronization point is reached", zap.Uint32("point", s.p.Load()),
+						zap.Uint32("mptHeight", sr.CurrentLocalHeight()),
+						zap.Uint32("headerHeight", s.chain.BlockHeight()),
+						zap.Uint32("blockHeight", s.chain.BlockHeight()))
+				}
+			}
 		}
 	}
 
@@ -822,7 +901,7 @@ func (s *Server) handleGetMPTDataCmd(p Peer, inv *payload.MPTInventory) error {
 			break
 		}
 		err := s.chain.GetStateModule().Traverse(h,
-			func(node []byte) bool {
+			func(_ mpt.Node, node []byte) bool {
 				l := len(node)
 				size := l + io.GetVarSize(l)
 				if size > capLeft {
@@ -831,7 +910,7 @@ func (s *Server) handleGetMPTDataCmd(p Peer, inv *payload.MPTInventory) error {
 				resp.Nodes = append(resp.Nodes, node)
 				capLeft -= size
 				return false
-			})
+			}, false)
 		if err != nil {
 			return fmt.Errorf("failed to traverse MPT starting from %s: %w", h.StringBE(), err)
 		}
@@ -998,38 +1077,43 @@ func (s *Server) handleHeadersCmd(p Peer, h *payload.Headers) error {
 		return err
 	}
 	if pSync := s.p.Load(); pSync != 0 && s.chain.GetStateModule().CurrentLocalHeight() != pSync && s.chain.HeaderHeight() > pSync {
-		header, err := s.chain.GetHeader(s.chain.GetHeaderHash(int(pSync) + 1))
-		if err != nil {
-			s.log.Fatal("failed to get header to init MPT",
-				zap.Uint32("height", pSync+1),
-				zap.Error(err))
-		}
-		err = s.chain.GetStateModule().InitOnRestore(&state.MPTRoot{
-			Index: pSync,
-			Root:  header.PrevStateRoot,
-		}, s.chain.GetConfig().KeepOnlyLatestState)
-		if err != nil {
-			s.log.Fatal("failed to initialize state module to start state exchange",
-				zap.Error(err))
-		}
-		s.mptPool.Add(header.PrevStateRoot, []byte{})
-		s.log.Info("MPT initialized",
-			zap.Uint32("height", pSync),
-			zap.String("state root", header.PrevStateRoot.StringBE()))
-		err = s.chain.InitOnRestore(pSync)
-		if err != nil {
-			s.log.Fatal("failed to init Blockchain for state sync", zap.Error(err))
-		}
-		err = s.requestMPTNodes(p, map[util.Uint256][]byte{header.PrevStateRoot: {}})
+		stateRoot := s.initOnRestore(pSync)
+		err = s.requestMPTNodes(p, map[util.Uint256][]byte{stateRoot: {}})
 		if err != nil {
 			s.log.Warn("failed to request MPT root",
 				zap.Uint32("height", pSync),
-				zap.String("state root", header.PrevStateRoot.StringBE()),
+				zap.String("state root", stateRoot.StringBE()),
 				zap.Error(err))
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Server) initOnRestore(pSync uint32) util.Uint256 {
+	header, err := s.chain.GetHeader(s.chain.GetHeaderHash(int(pSync) + 1))
+	if err != nil {
+		s.log.Fatal("failed to get header to init MPT",
+			zap.Uint32("height", pSync+1),
+			zap.Error(err))
+	}
+	err = s.chain.GetStateModule().InitOnRestore(&state.MPTRoot{
+		Index: pSync,
+		Root:  header.PrevStateRoot,
+	}, s.chain.GetConfig().KeepOnlyLatestState)
+	if err != nil {
+		s.log.Fatal("failed to initialize state module to start state exchange",
+			zap.Error(err))
+	}
+	s.log.Info("MPT initialized",
+		zap.Uint32("height", pSync),
+		zap.String("state root", header.PrevStateRoot.StringBE()))
+	err = s.chain.InitOnRestore(pSync)
+	if err != nil {
+		s.log.Fatal("failed to init Blockchain for state sync", zap.Error(err))
+	}
+	s.mptPool.Add(header.PrevStateRoot, []byte{})
+	return header.PrevStateRoot
 }
 
 // handleExtensibleCmd processes received extensible payload.
