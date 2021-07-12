@@ -637,6 +637,7 @@ func (s *Server) IsInSync() bool {
 		// 1) If chain's height is too low to start state exchange process, then use the standard sync mechanism
 		if p1 < 2*syncInterval {
 			s.canStartSync.CAS(false, true)
+			s.GetStateRoot().OnSyncReached()
 		} else {
 			if s.p.CAS(0, p1) {
 				s.log.Info("try to sync state for latest state synchronization point", zap.Uint32("height", p1))
@@ -664,10 +665,18 @@ func (s *Server) IsInSync() bool {
 					_ = s.requestMPTNodes(nil, map[util.Uint256][]byte{stateRoot: {}})
 				} else if h == p1 {
 					// 3.2) Stateroot for P1 is stored, so traverse local MPT and request unknown hash nodes
+					err := s.chain.GetStateModule().InitOnRestore(&state.MPTRoot{ // still need to initialize it to set proper isOnSync
+						Index: p1,
+						Root:  sr.CurrentLocalStateRoot(),
+					}, s.chain.GetConfig().KeepOnlyLatestState)
+					if err != nil {
+						s.log.Fatal("failed to initialize state module to start state exchange",
+							zap.Error(err))
+					}
 					go s.mptPool.ResendStaleItems()
 					unknownNodes := make(map[util.Uint256][]byte)
 					unknownNodes[sr.CurrentLocalStateRoot()] = []byte{}
-					err := sr.Traverse(sr.CurrentLocalStateRoot(), func(n mpt.Node, _ []byte) bool {
+					err = sr.Traverse(sr.CurrentLocalStateRoot(), func(n mpt.Node, _ []byte) bool {
 						path, ok := unknownNodes[n.Hash()]
 						if !ok {
 							panic("bug")
@@ -692,6 +701,7 @@ func (s *Server) IsInSync() bool {
 					mptInSync = true
 				}
 				if mptInSync {
+					sr.OnSyncReached()
 					s.log.Info("MPT is in sync",
 						zap.Uint32("height", s.chain.GetStateModule().CurrentLocalHeight()),
 						zap.String("state root", s.chain.GetStateModule().CurrentLocalStateRoot().StringBE()))
@@ -967,6 +977,7 @@ func (s *Server) handleMPTDataCmd(p Peer, data *payload.MPTData) error {
 		_ = s.requestMPTNodes(p, toBeRequested)
 	} else if s.mptPool.Count() == 0 {
 		// there are no Nodes we need to fetch, thus MPT sync process considered to be ended
+		s.GetStateRoot().OnSyncReached()
 		s.log.Info("MPT successfully synced",
 			zap.Uint32("height", s.chain.GetStateModule().CurrentLocalHeight()),
 			zap.String("state root", s.chain.GetStateModule().CurrentLocalStateRoot().StringBE()))
@@ -1525,6 +1536,7 @@ func (s *Server) relayBlocksLoop() {
 			return
 		case b := <-ch:
 			if !s.canStartSync.Load() && b.Index == s.p.Load() && s.mptPool.Count() == 0 && s.canStartSync.CAS(false, true) {
+				s.GetStateRoot().OnSyncReached()
 				s.log.Info("state sync for the latest state synchronization point is reached", zap.Uint32("height", s.p.Load()))
 			}
 			msg := NewMessage(CMDInv, payload.NewInventory(payload.BlockType, []util.Uint256{b.Hash()}))
