@@ -655,10 +655,10 @@ func (s *Server) IsInSync() bool {
 				if h < p1 {
 					// 3.1) Another stateroot may be stored (i.e. for height < P1), thus need to store actual stateroot and request MPT state for P1
 					stateRoot := s.initOnRestore(p1)
-					msg := NewMessage(CMDGetMPTData, payload.NewMPTInventory([]util.Uint256{stateRoot}))
-					s.broadcastMessage(msg)
+					_ = s.requestMPTNodes(nil, map[util.Uint256][]byte{stateRoot: {}})
 				} else if h == p1 {
 					// 3.2) Stateroot for P1 is stored, so traverse local MPT and request unknown hash nodes
+					go s.mptPool.ResendStaleItems()
 					unknownNodes := make(map[util.Uint256][]byte)
 					unknownNodes[sr.CurrentLocalStateRoot()] = []byte{}
 					err := sr.Traverse(sr.CurrentLocalStateRoot(), func(n mpt.Node, _ []byte) bool {
@@ -679,8 +679,9 @@ func (s *Server) IsInSync() bool {
 					s.mptPool.Update(nil, unknownNodes)
 					if len(unknownNodes) == 0 {
 						mptInSync = true
+					} else {
+						_ = s.requestMPTNodes(nil, unknownNodes) // no error when broadcasting
 					}
-					// TODO: request nodes
 				} else {
 					mptInSync = true
 				}
@@ -940,7 +941,8 @@ func (s *Server) handleMPTDataCmd(p Peer, data *payload.MPTData) error {
 		}
 		itm, ok := s.mptPool.TryGet(n.Hash())
 		if !ok {
-			return fmt.Errorf("unable to validate MPT node %s", n.Hash().StringBE())
+			// it can easily happen after receiving the same data from different peers.
+			return nil
 		}
 
 		err := s.chain.GetStateModule().RestoreMPTNode(itm, n.Node)
@@ -969,17 +971,25 @@ func (s *Server) handleMPTDataCmd(p Peer, data *payload.MPTData) error {
 	return nil
 }
 
-// requestMPTNodes requests specified MPT nodes from the peer.
+// requestMPTNodes requests specified MPT nodes from the peer or broadcasts
+// request if peer is not specified.
 func (s *Server) requestMPTNodes(p Peer, itms map[util.Uint256][]byte) error {
+	stateSyncP := s.p.Load()
 	hashes := make([]util.Uint256, 0, payload.MaxMPTHashesCount)
 	for h := range itms {
 		hashes = append(hashes, h)
 		if len(hashes) == payload.MaxMPTHashesCount || len(hashes) == len(itms) {
 			pl := payload.NewMPTInventory(hashes)
 			msg := NewMessage(CMDGetMPTData, pl)
-			err := p.EnqueueP2PMessage(msg)
-			if err != nil {
-				return err
+			if p != nil {
+				err := p.EnqueueP2PMessage(msg)
+				if err != nil {
+					return err
+				}
+			} else {
+				s.iteratePeersWithSendMsg(msg, Peer.EnqueuePacket, func(p Peer) bool {
+					return p.LastBlockIndex() >= stateSyncP
+				})
 			}
 			hashes = hashes[:0]
 		}
@@ -1113,6 +1123,7 @@ func (s *Server) initOnRestore(pSync uint32) util.Uint256 {
 		s.log.Fatal("failed to init Blockchain for state sync", zap.Error(err))
 	}
 	s.mptPool.Add(header.PrevStateRoot, []byte{})
+	go s.mptPool.ResendStaleItems()
 	return header.PrevStateRoot
 }
 
@@ -1564,6 +1575,12 @@ func (s *Server) initStaleMemPools() {
 	mp.SetResendThreshold(uint32(threshold), s.broadcastTX)
 	if s.chain.P2PSigExtensionsEnabled() {
 		s.notaryRequestPool.SetResendThreshold(uint32(threshold), s.broadcastP2PNotaryRequestPayload)
+	}
+	if cfg.P2PStateExchangeExtensions {
+		// TODO: add config option for resend threshold
+		s.mptPool.SetResendThreshold(2*time.Second, func(items map[util.Uint256][]byte) {
+			_ = s.requestMPTNodes(nil, items)
+		})
 	}
 }
 

@@ -1,21 +1,32 @@
 package mptpool
 
 import (
+	"sync"
+	"time"
+
 	"github.com/nspcc-dev/neo-go/pkg/core/storage"
 	"github.com/nspcc-dev/neo-go/pkg/util"
+	"go.uber.org/atomic"
 )
 
 // Pool stores unknown MPT nodes along with the corresponding paths.
 type Pool struct {
 	hashes *storage.MemoryStore
 
-	// TODO: retransmission
+	lock            sync.RWMutex
+	resendThreshold time.Duration
+	resendFunc      func(map[util.Uint256][]byte)
+
+	batchCh          chan struct{}
+	retransmissionOn *atomic.Bool
 }
 
 // New returns new MPT node hashes pool using provided chain.
 func New() *Pool {
 	return &Pool{
-		hashes: storage.NewMemoryStore(),
+		hashes:           storage.NewMemoryStore(),
+		batchCh:          make(chan struct{}),
+		retransmissionOn: atomic.NewBool(false),
 	}
 }
 
@@ -62,9 +73,45 @@ func (mp *Pool) Update(remove map[util.Uint256]bool, add map[util.Uint256][]byte
 		batch.Put(h.BytesBE(), itm)
 	}
 	_ = mp.hashes.PutBatch(batch)
+	if mp.retransmissionOn.Load() {
+		mp.batchCh <- struct{}{}
+	}
 }
 
 // Count returns the number of items in the pool.
 func (mp *Pool) Count() int {
 	return mp.hashes.Count()
+}
+
+// SetResendThreshold sets threshold after which MPT data requests will be considered
+// stale and retransmitted by `ResendStaleItems` routine.
+func (mp *Pool) SetResendThreshold(t time.Duration, f func(map[util.Uint256][]byte)) {
+	mp.lock.Lock()
+	defer mp.lock.Unlock()
+	mp.resendThreshold = t
+	mp.resendFunc = f
+}
+
+// ResendStaleItems starts cycle that manages stale MPT data requests (must be run
+// in a separate go-routine). The cycle will be automatically exited after MPT sync
+// process is ended, i.e. when no nodes are left in pool after Update.
+func (mp *Pool) ResendStaleItems() {
+	if !mp.retransmissionOn.CAS(false, true) {
+		return
+	}
+	timer := time.NewTimer(mp.resendThreshold)
+	for {
+		select {
+		case <-timer.C:
+			mp.resendFunc(mp.GetAll())
+			timer.Reset(mp.resendThreshold)
+		case <-mp.batchCh:
+			if mp.Count() == 0 {
+				mp.retransmissionOn.Store(false)
+				return
+			}
+			// new batch is firstly requested by server, no need to duplicate requests
+			timer.Reset(mp.resendThreshold)
+		}
+	}
 }
