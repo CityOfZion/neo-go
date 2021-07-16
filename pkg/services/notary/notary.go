@@ -37,7 +37,7 @@ type (
 		onTransaction func(tx *transaction.Transaction) error
 		// newTxs is a channel where new transactions are sent
 		// to be processed in a `onTransaction` callback.
-		newTxs chan []txHashPair
+		newTxs chan txHashPair
 
 		// reqMtx protects requests list.
 		reqMtx sync.RWMutex
@@ -112,7 +112,7 @@ func NewNotary(cfg Config, net netmode.Magic, mp *mempool.Pool, onTransaction fu
 		Network:       net,
 		wallet:        wallet,
 		onTransaction: onTransaction,
-		newTxs:        make(chan []txHashPair, 1),
+		newTxs:        make(chan txHashPair, 100),
 		mp:            mp,
 		reqCh:         make(chan mempoolevent.Event),
 		blocksCh:      make(chan *block.Block),
@@ -342,19 +342,9 @@ type txHashPair struct {
 }
 
 func (n *Notary) pushNewTx(tx *transaction.Transaction, h util.Uint256) {
-	var txs []txHashPair
 	select {
-	case txs = <-n.newTxs:
+	case n.newTxs <- txHashPair{tx, h}:
 	default:
-	}
-
-	txs = append(txs, txHashPair{tx, h})
-
-	// Guaranteed to succeed because `cap(n.newTx) == 1`.
-	select {
-	case n.newTxs <- txs:
-	default: // FIXME remove
-		panic("invalid implementation")
 	}
 }
 
@@ -362,31 +352,28 @@ func (n *Notary) newTxCallbackLoop() {
 	for {
 		fmt.Println("wait")
 		select {
-		case txs := <-n.newTxs:
-			fmt.Println("recv", len(txs))
-			for i := range txs {
-				n.reqMtx.Lock()
-				if r, ok := n.requests[txs[i].h]; !ok || r.isSent && txs[i].h == txs[i].tx.Hash() {
-					n.reqMtx.Unlock()
-					continue
-				}
+		case tx := <-n.newTxs:
+			n.reqMtx.Lock()
+			if r, ok := n.requests[tx.h]; !ok || r.isSent && tx.h == tx.tx.Hash() {
 				n.reqMtx.Unlock()
-
-				err := n.onTransaction(txs[i].tx)
-				if err != nil {
-					n.Config.Log.Error("new transaction callback finished with error", zap.Error(err))
-				}
-
-				n.reqMtx.Lock()
-				if r, ok := n.requests[txs[i].h]; ok {
-					if err != nil && txs[i].h != txs[i].tx.Hash() {
-						r.fallbacks = append(r.fallbacks, txs[i].tx)
-					} else if err == nil && txs[i].h == txs[i].tx.Hash() {
-						r.isSent = true
-					}
-				}
-				n.reqMtx.Unlock()
+				continue
 			}
+			n.reqMtx.Unlock()
+
+			err := n.onTransaction(tx.tx)
+			if err != nil {
+				n.Config.Log.Error("new transaction callback finished with error", zap.Error(err))
+			}
+
+			n.reqMtx.Lock()
+			if r, ok := n.requests[tx.h]; ok {
+				if err != nil && tx.h != tx.tx.Hash() {
+					r.fallbacks = append(r.fallbacks, tx.tx)
+				} else if err == nil && tx.h == tx.tx.Hash() {
+					r.isSent = true
+				}
+			}
+			n.reqMtx.Unlock()
 		case <-n.stopCh:
 			return
 		}
