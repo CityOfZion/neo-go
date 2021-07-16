@@ -287,6 +287,7 @@ func (n *Notary) PostPersist() {
 	for h, r := range n.requests {
 		fmt.Println("REQ", r.isSent)
 		if !r.isSent && r.typ != Unknown && r.nSigs == r.nSigsCollected && r.minNotValidBefore > currHeight {
+			fmt.Println("finalize main", r.main.Hash(), h)
 			if err := n.finalize(r.main, h); err != nil {
 				n.Config.Log.Error("failed to finalize main transaction", zap.Error(err))
 			}
@@ -296,6 +297,7 @@ func (n *Notary) PostPersist() {
 			newFallbacks := r.fallbacks[:0]
 			for _, fb := range r.fallbacks {
 				if nvb := fb.GetAttributes(transaction.NotValidBeforeT)[0].Value.(*transaction.NotValidBefore).Height; nvb <= currHeight {
+					fmt.Println("finalize fallback", fb.Hash(), h)
 					if err := n.finalize(fb, h); err != nil {
 						newFallbacks = append(newFallbacks, fb) // wait for the next block to resend them
 					}
@@ -382,8 +384,6 @@ func (n *Notary) newTxCallbackLoop() {
 					} else if err == nil && txs[i].h == txs[i].tx.Hash() {
 						r.isSent = true
 					}
-				} else { // FIXME remove
-					panic("invalid implementation")
 				}
 				n.reqMtx.Unlock()
 			}
