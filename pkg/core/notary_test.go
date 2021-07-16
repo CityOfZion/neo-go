@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,8 @@ func TestNotary(t *testing.T) {
 			if finalizeWithError {
 				return errors.New("error while finalizing transaction")
 			}
+			debug.PrintStack()
+			fmt.Println("first complete", tx.Hash())
 			completedTxes[tx.Hash()] = tx
 			return nil
 		}
@@ -88,6 +91,7 @@ func TestNotary(t *testing.T) {
 				return errors.New("error while finalizing transaction")
 			}
 		}
+		fmt.Println("first complete", tx.Hash())
 		completedTxes[tx.Hash()] = tx
 		return nil
 	}
@@ -100,6 +104,12 @@ func TestNotary(t *testing.T) {
 	bc.SetNotary(ntr1)
 	bc.RegisterPostBlock(func(bc blockchainer.Blockchainer, pool *mempool.Pool, b *block.Block) {
 		ntr1.PostPersist()
+	})
+	go ntr1.Run()
+	mp1.RunSubscriptions()
+	t.Cleanup(func() {
+		ntr1.Stop()
+		mp1.StopSubscriptions()
 	})
 
 	notaryNodes := keys.PublicKeys{acc1.PrivateKey().PublicKey(), acc2.PrivateKey().PublicKey()}
@@ -256,7 +266,10 @@ func TestNotary(t *testing.T) {
 		nKeys := len(requests)
 		completedTx := completedTxes[requests[0].MainTransaction.Hash()]
 		if sentCount == nKeys && shouldComplete {
-			require.NotNil(t, completedTx, errors.New("main transaction expected to be completed"))
+			require.Eventually(t, func() bool {
+				completedTx = completedTxes[requests[0].MainTransaction.Hash()]
+				return completedTx != nil
+			}, time.Second, time.Millisecond*50, errors.New("main transaction expected to be completed"))
 			require.Equal(t, nKeys+1, len(completedTx.Signers))
 			require.Equal(t, nKeys+1, len(completedTx.Scripts))
 
@@ -274,13 +287,22 @@ func TestNotary(t *testing.T) {
 				VerificationScript: []byte{},
 			}, completedTx.Scripts[nKeys])
 		} else {
-			require.Nil(t, completedTx, fmt.Errorf("main transaction shouldn't be completed: sent %d out of %d requests", sentCount, nKeys))
+			require.Eventually(t, func() bool {
+				completedTx = completedTxes[requests[0].MainTransaction.Hash()]
+				if completedTx != nil {
+					fmt.Println("completed tx", completedTx.Hash())
+				}
+				return completedTx == nil
+			}, time.Second, time.Millisecond*50, fmt.Errorf("main transaction shouldn't be completed: sent %d out of %d requests", sentCount, nKeys))
 		}
 	}
 	checkMultisigTx := func(t *testing.T, nSigs int, requests []*payload.P2PNotaryRequest, sentCount int, shouldComplete bool) {
 		completedTx := completedTxes[requests[0].MainTransaction.Hash()]
 		if sentCount >= nSigs && shouldComplete {
-			require.NotNil(t, completedTx, errors.New("main transaction expected to be completed"))
+			require.Eventually(t, func() bool {
+				completedTx = completedTxes[requests[0].MainTransaction.Hash()]
+				return completedTx != nil
+			}, time.Second, time.Millisecond*50, errors.New("main transaction expected to be completed"))
 			require.Equal(t, 2, len(completedTx.Signers))
 			require.Equal(t, 2, len(completedTx.Scripts))
 			interopCtx := bc.newInteropContext(trigger.Verification, bc.dao, nil, completedTx)
@@ -306,7 +328,10 @@ func TestNotary(t *testing.T) {
 		for i, req := range requests {
 			completedTx := completedTxes[req.FallbackTransaction.Hash()]
 			if shouldComplete {
-				require.NotNil(t, completedTx, fmt.Errorf("fallback transaction for request #%d expected to be completed", i))
+				require.Eventually(t, func() bool {
+					completedTx = completedTxes[req.FallbackTransaction.Hash()]
+					return completedTx != nil
+				}, time.Second, time.Millisecond*50, errors.New("main transaction expected to be completed"))
 				require.Equal(t, 2, len(completedTx.Signers))
 				require.Equal(t, 2, len(completedTx.Scripts))
 				require.Equal(t, transaction.Witness{
@@ -636,12 +661,6 @@ func TestNotary(t *testing.T) {
 	checkFallbackTxs(t, requests, false)
 
 	// Subscriptions test
-	mp1.RunSubscriptions()
-	go ntr1.Run()
-	t.Cleanup(func() {
-		ntr1.Stop()
-		mp1.StopSubscriptions()
-	})
 	finalizeWithError = false
 	requester1, _ := wallet.NewAccount()
 	requester2, _ := wallet.NewAccount()

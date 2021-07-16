@@ -359,7 +359,6 @@ func (mp *Pool) RemoveStale(isOK func(*transaction.Transaction) bool, feer Feer)
 	height := feer.BlockHeight()
 	var (
 		staleItems []item
-		events     []mempoolevent.Event
 	)
 	for _, itm := range mp.verifiedTxes {
 		if isOK(itm.txn) && mp.checkPolicy(itm.txn, policyChanged) && mp.tryAddSendersFee(itm.txn, feer, true) {
@@ -384,20 +383,13 @@ func (mp *Pool) RemoveStale(isOK func(*transaction.Transaction) bool, feer Feer)
 				delete(mp.oracleResp, attrs[0].Value.(*transaction.OracleResponse).ID)
 			}
 			if mp.subscriptionsOn.Load() {
-				events = append(events, mempoolevent.Event{
+				mp.events <- mempoolevent.Event{
 					Type: mempoolevent.TransactionRemoved,
 					Tx:   itm.txn,
 					Data: itm.data,
-				})
+				}
 			}
 		}
-	}
-	if len(events) != 0 {
-		go func() {
-			for i := range events {
-				mp.events <- events[i]
-			}
-		}()
 	}
 	if len(staleItems) != 0 {
 		go mp.resendStaleItems(staleItems)
