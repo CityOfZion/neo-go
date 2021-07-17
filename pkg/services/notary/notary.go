@@ -35,6 +35,9 @@ type (
 
 		// onTransaction is a callback for completed transactions (mains or fallbacks) sending.
 		onTransaction func(tx *transaction.Transaction) error
+		// newTxs is a channel where new transactions are sent
+		// to be processed in a `onTransaction` callback.
+		newTxs chan txHashPair
 
 		// reqMtx protects requests list.
 		reqMtx sync.RWMutex
@@ -109,6 +112,7 @@ func NewNotary(cfg Config, net netmode.Magic, mp *mempool.Pool, onTransaction fu
 		Network:       net,
 		wallet:        wallet,
 		onTransaction: onTransaction,
+		newTxs:        make(chan txHashPair, 100),
 		mp:            mp,
 		reqCh:         make(chan mempoolevent.Event),
 		blocksCh:      make(chan *block.Block),
@@ -121,6 +125,7 @@ func (n *Notary) Run() {
 	n.Config.Log.Info("starting notary service")
 	n.Config.Chain.SubscribeForBlocks(n.blocksCh)
 	n.mp.SubscribeForTransactions(n.reqCh)
+	go n.newTxCallbackLoop()
 	for {
 		select {
 		case <-n.stopCh:
@@ -236,10 +241,8 @@ func (n *Notary) OnNewRequest(payload *payload.P2PNotaryRequest) {
 		}
 	}
 	if r.typ != Unknown && r.nSigsCollected == nSigs && r.minNotValidBefore > n.Config.Chain.BlockHeight() {
-		if err := n.finalize(r.main); err != nil {
+		if err := n.finalize(r.main, payload.MainTransaction.Hash()); err != nil {
 			n.Config.Log.Error("failed to finalize main transaction", zap.Error(err))
-		} else {
-			r.isSent = true
 		}
 	}
 }
@@ -264,6 +267,7 @@ func (n *Notary) OnRequestRemoval(pld *payload.P2PNotaryRequest) {
 		}
 	}
 	if len(r.fallbacks) == 0 {
+		fmt.Println("remove main")
 		delete(n.requests, r.main.Hash())
 	}
 }
@@ -275,15 +279,17 @@ func (n *Notary) PostPersist() {
 		return
 	}
 
+	n.Config.Log.Info("post persist")
 	n.reqMtx.Lock()
 	defer n.reqMtx.Unlock()
 	currHeight := n.Config.Chain.BlockHeight()
+	n.Config.Log.Info("size", zap.Int("size", len(n.requests)))
 	for h, r := range n.requests {
+		fmt.Println("REQ", r.isSent)
 		if !r.isSent && r.typ != Unknown && r.nSigs == r.nSigsCollected && r.minNotValidBefore > currHeight {
-			if err := n.finalize(r.main); err != nil {
+			fmt.Println("finalize main", r.main.Hash(), h)
+			if err := n.finalize(r.main, h); err != nil {
 				n.Config.Log.Error("failed to finalize main transaction", zap.Error(err))
-			} else {
-				r.isSent = true
 			}
 			continue
 		}
@@ -291,24 +297,21 @@ func (n *Notary) PostPersist() {
 			newFallbacks := r.fallbacks[:0]
 			for _, fb := range r.fallbacks {
 				if nvb := fb.GetAttributes(transaction.NotValidBeforeT)[0].Value.(*transaction.NotValidBefore).Height; nvb <= currHeight {
-					if err := n.finalize(fb); err != nil {
+					fmt.Println("finalize fallback", fb.Hash(), h)
+					if err := n.finalize(fb, h); err != nil {
 						newFallbacks = append(newFallbacks, fb) // wait for the next block to resend them
 					}
 				} else {
 					newFallbacks = append(newFallbacks, fb)
 				}
 			}
-			if len(newFallbacks) == 0 {
-				delete(n.requests, h)
-			} else {
-				r.fallbacks = newFallbacks
-			}
+			r.fallbacks = newFallbacks
 		}
 	}
 }
 
 // finalize adds missing Notary witnesses to the transaction (main or fallback) and pushes it to the network.
-func (n *Notary) finalize(tx *transaction.Transaction) error {
+func (n *Notary) finalize(tx *transaction.Transaction, h util.Uint256) error {
 	acc := n.getAccount()
 	if acc == nil {
 		panic(errors.New("no available Notary account")) // unreachable code, because all callers of `finalize` check that acc != nil
@@ -328,7 +331,53 @@ func (n *Notary) finalize(tx *transaction.Transaction) error {
 		return fmt.Errorf("failed to update completed transaction's size: %w", err)
 	}
 
-	return n.onTransaction(newTx)
+	n.pushNewTx(newTx, h)
+
+	return nil
+}
+
+type txHashPair struct {
+	tx *transaction.Transaction
+	h  util.Uint256
+}
+
+func (n *Notary) pushNewTx(tx *transaction.Transaction, h util.Uint256) {
+	select {
+	case n.newTxs <- txHashPair{tx, h}:
+	default:
+	}
+}
+
+func (n *Notary) newTxCallbackLoop() {
+	for {
+		fmt.Println("wait")
+		select {
+		case tx := <-n.newTxs:
+			n.reqMtx.Lock()
+			if r, ok := n.requests[tx.h]; !ok || r.isSent && tx.h == tx.tx.Hash() {
+				n.reqMtx.Unlock()
+				continue
+			}
+			n.reqMtx.Unlock()
+
+			err := n.onTransaction(tx.tx)
+			if err != nil {
+				n.Config.Log.Error("new transaction callback finished with error", zap.Error(err))
+			}
+
+			n.reqMtx.Lock()
+			if r, ok := n.requests[tx.h]; ok {
+				if err != nil && tx.h != tx.tx.Hash() {
+					r.fallbacks = append(r.fallbacks, tx.tx)
+				} else if err == nil && tx.h == tx.tx.Hash() {
+					r.isSent = true
+				}
+			}
+			n.reqMtx.Unlock()
+		case <-n.stopCh:
+			return
+		}
+	}
 }
 
 // updateTxSize returns transaction with re-calculated size and an error.
